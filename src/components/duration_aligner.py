@@ -59,9 +59,8 @@ def scaled_dot_attention(key, key_lens, query, query_lens, e_weight=None):
 
 
 class DurationAligner(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int):
+    def __init__(self):
         super(DurationAligner, self).__init__()
-        self.projection = nn.Linear(input_dim, hidden_dim)
 
     def forward(
         self,
@@ -76,7 +75,6 @@ class DurationAligner(nn.Module):
         mel_h: Tensor<B, T2, D>
         mel_lens: Tensor<B>
         """
-        embeds = self.projection(embeds)
         embeds_len_list = embeds_len.tolist()
         mel_lens_list = mel_lens.tolist()
         e_weight = generate_weights(

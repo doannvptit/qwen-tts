@@ -14,11 +14,10 @@ datasets:
     text_column: text
     audio_column: audio
 
-model_config: ./configs/qwen3_4b.yaml
-model_template: ./configs/qwen3.template
+model_config: ./configs/LFM2.5-1.2B-Instruct.yaml
 training:
-  output_dir: ./checkpoints/qwen3_4b
-  num_train_epochs: 2
+  output_dir: ./checkpoints/LFM2.5-1.2B-Instruct
+  num_train_epochs: 20
   per_device_train_batch_size: 64
   gradient_accumulation_steps: 1
   learning_rate: 1e-4

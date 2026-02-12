@@ -1,0 +1,36 @@
+model: "unsloth/Qwen3-4B-Instruct-2507"
+template: "configs/Qwen3-4B-Instruct.jinja"
+vocos_model_id: "charactr/vocos-mel-24khz"
+peft:
+  enabled: false
+  task_type: "CAUSAL_LM"
+  r: 8
+  lora_alpha: 16
+  lora_dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+  bias: "none"
+talker:
+  delta: 0.2
+  look_ahead: 3
+  input_dim: 2560
+  hidden_dim: 512
+
+  encoder_layers: 6
+  encoder_heads: 2
+  encoder_conv_kernel_size: [ 9, 1 ]
+  encoder_max_position: 4096
+  
+  duration_predictor_kernel_size: 5
+  duration_predictor_num_layers: 3
+  mel_encoder_kernel_size: 5
+  mel_encoder_num_layers: 6
+  mel_decoder_kernel_size: 5
+  mel_decoder_num_layers: 6
+  post_net_kernel_size: 9
+  post_net_num_layers: 5
+  dropout_rate: 0.1
+  mel_bins: 100

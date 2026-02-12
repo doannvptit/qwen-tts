@@ -18,11 +18,31 @@ from transformers import get_scheduler
 
 from src.model import LlmSpokenModel, LlmSpokenModelConfig
 
-SYSTEM_PROMPT = "say exactly provided sentence"
+SYSTEM_PROMPTS = [
+    "say exactly provided sentence",
+    "repeat the following sentence",
+    "please say the following sentence",
+    "say the sentence exactly as given",
+    "repeat exactly what is written below",
+    "please repeat the sentence verbatim",
+    "say the following text exactly",
+    "repeat the provided sentence exactly",
+    "speak the sentence exactly as written",
+    "read and repeat the following sentence",
+    "please repeat exactly the given sentence",
+    "say precisely the provided sentence",
+    "repeat word for word the following sentence",
+    "please say exactly what is written",
+    "read the sentence and repeat it exactly",
+    "repeat the sentence without any changes",
+    "say the exact sentence provided",
+    "please repeat the exact sentence below",
+    "repeat exactly the sentence given",
+    "speak exactly the following sentence",
+]
 TEXT_COLUMN = "transcription"
 AUDIO_COLUMN = "audio"
 DEFAULT_SPLIT = "train"
-
 
 @dataclass
 class DatasetSpec:
@@ -62,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=str,
-        default="trainings/qwen3_4b.yaml",
+        default="trainings/Qwen3-4B-Instruct.yaml",
         help="Path to training yaml config.",
     )
     return parser.parse_args()
@@ -164,7 +184,7 @@ def collate_batch(samples: list[dict]) -> dict:
         text = str(sample[TEXT_COLUMN])
         messages_batch.append(
             [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": random.choice(SYSTEM_PROMPTS)},
                 {"role": "user", "content": text},
                 {"role": "assistant", "content": text},
             ]
@@ -262,8 +282,7 @@ def main() -> None:
     model_cfg = LlmSpokenModelConfig.from_yaml(cfg.model_config)
     model = LlmSpokenModel(model_cfg)
     model.to(device)
-    model.model.eval()
-    model.talker.train()
+    model.setup_for_training()
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"trainable_params={trainable_params:,}")
@@ -278,7 +297,7 @@ def main() -> None:
     )
 
     optimizer = AdamW(
-        model.talker.parameters(),
+        model.optimizer_param_groups(),
         lr=cfg.training.learning_rate,
         weight_decay=cfg.training.weight_decay,
     )
