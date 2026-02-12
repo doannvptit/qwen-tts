@@ -1,0 +1,16 @@
+model: "unsloth/Qwen3-4B-Instruct-2507"
+template: "configs/qwen3.jinja"
+vocos_model_id: "charactr/vocos-mel-24khz"
+talker:
+  input_dim: 2560
+  hidden_dim: 512
+  duration_predictor_kernel_size: 5
+  duration_predictor_num_layers: 4
+  mel_encoder_kernel_size: 5
+  mel_encoder_num_layers: 4
+  mel_decoder_kernel_size: 5
+  mel_decoder_num_layers: 4
+  post_net_kernel_size: 5
+  post_net_num_layers: 4
+  dropout_rate: 0.1
+  mel_bins: 100
