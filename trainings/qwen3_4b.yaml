@@ -26,6 +26,7 @@ training:
   warmup_ratio: 0.1
   logging_steps: 10
   save_steps: 1000
+  keep_last_n_checkpoints: 3
   audio_dump_steps: 1000
   audio_dump_num_samples: 2
   seed: 42

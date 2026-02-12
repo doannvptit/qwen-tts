@@ -76,6 +76,7 @@ python train.py --config trainings/qwen3_4b.yaml
 ## Training outputs
 
 - Checkpoints are saved to `training.output_dir` (default: `checkpoints/qwen3_4b`).
+- Set `training.keep_last_n_checkpoints` to keep only the most recent N checkpoints (`0` keeps all).
 - Model snapshot includes:
   - `model/config.yaml`
   - `model/talker.safetensors`

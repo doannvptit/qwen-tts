@@ -1,6 +1,7 @@
 import argparse
 import math
 import random
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,6 +44,7 @@ class TrainingConfig:
     warmup_ratio: float
     logging_steps: int
     save_steps: int
+    keep_last_n_checkpoints: int
     audio_dump_steps: int
     audio_dump_num_samples: int
     seed: int
@@ -100,6 +102,7 @@ def load_run_config(config_path: Path) -> tuple[RunConfig, dict]:
         warmup_ratio=float(train_raw["warmup_ratio"]),
         logging_steps=int(train_raw["logging_steps"]),
         save_steps=int(train_raw["save_steps"]),
+        keep_last_n_checkpoints=int(train_raw.get("keep_last_n_checkpoints", 0)),
         audio_dump_steps=int(train_raw.get("audio_dump_steps", 0)),
         audio_dump_num_samples=int(train_raw.get("audio_dump_num_samples", 2)),
         seed=int(train_raw["seed"]),
@@ -110,6 +113,8 @@ def load_run_config(config_path: Path) -> tuple[RunConfig, dict]:
         raise ValueError("logging_steps must be >= 1")
     if training_cfg.save_steps < 1:
         raise ValueError("save_steps must be >= 1")
+    if training_cfg.keep_last_n_checkpoints < 0:
+        raise ValueError("keep_last_n_checkpoints must be >= 0")
     if training_cfg.audio_dump_steps < 0:
         raise ValueError("audio_dump_steps must be >= 0")
     if training_cfg.audio_dump_num_samples < 1:
@@ -179,6 +184,7 @@ def save_checkpoint(
     optimizer: AdamW,
     scheduler,
     epoch: int,
+    keep_last_n_checkpoints: int,
 ) -> None:
     ckpt_dir = output_dir / f"step_{global_step}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -194,6 +200,23 @@ def save_checkpoint(
         },
         ckpt_dir / "trainer_state.pt",
     )
+
+    if keep_last_n_checkpoints > 0:
+        checkpoint_dirs: list[tuple[int, Path]] = []
+        for path in output_dir.glob("step_*"):
+            if not path.is_dir():
+                continue
+            if not path.name.startswith("step_"):
+                continue
+            step_str = path.name[len("step_") :]
+            if not step_str.isdigit():
+                continue
+            checkpoint_dirs.append((int(step_str), path))
+
+        checkpoint_dirs.sort(key=lambda item: item[0])
+        stale_dirs = checkpoint_dirs[:-keep_last_n_checkpoints]
+        for _, stale_dir in stale_dirs:
+            shutil.rmtree(stale_dir, ignore_errors=False)
 
 
 def save_debug_audios(
@@ -341,7 +364,13 @@ def main() -> None:
 
                 if global_step % cfg.training.save_steps == 0:
                     save_checkpoint(
-                        output_dir, global_step, model, optimizer, scheduler, epoch
+                        output_dir,
+                        global_step,
+                        model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        cfg.training.keep_last_n_checkpoints,
                     )
 
                 if should_dump_audio:
@@ -367,6 +396,7 @@ def main() -> None:
         optimizer=optimizer,
         scheduler=scheduler,
         epoch=cfg.training.num_train_epochs,
+        keep_last_n_checkpoints=cfg.training.keep_last_n_checkpoints,
     )
     wandb.finish()
 
