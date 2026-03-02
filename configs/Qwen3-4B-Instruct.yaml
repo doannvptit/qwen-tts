@@ -2,10 +2,10 @@ model: "unsloth/Qwen3-4B-Instruct-2507"
 template: "configs/Qwen3-4B-Instruct.jinja"
 vocos_model_id: "charactr/vocos-mel-24khz"
 peft:
-  enabled: false
+  enabled: true
   task_type: "CAUSAL_LM"
-  r: 8
-  lora_alpha: 16
+  r: 32
+  lora_alpha: 32
   lora_dropout: 0.0
   target_modules:
     - q_proj
@@ -32,5 +32,5 @@ talker:
   mel_decoder_num_layers: 6
   post_net_kernel_size: 9
   post_net_num_layers: 5
-  dropout_rate: 0.1
+  dropout_rate: 0.0
   mel_bins: 100

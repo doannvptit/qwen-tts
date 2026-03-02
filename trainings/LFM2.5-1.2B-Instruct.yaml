@@ -24,8 +24,8 @@ training:
   weight_decay: 0.01
   warmup_ratio: 0.1
   logging_steps: 10
-  save_steps: 1000
-  keep_last_n_checkpoints: 3
-  audio_dump_steps: 1000
-  audio_dump_num_samples: 2
+  save_steps: 5000
+  keep_last_n_checkpoints: 100
+  audio_dump_steps: 5000
+  audio_dump_num_samples: 10
   seed: 42
