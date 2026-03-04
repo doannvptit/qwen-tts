@@ -15,7 +15,11 @@ from transformers import BitsAndBytesConfig, FineGrainedFP8Config
 from .components.wav_decoder import WavDecoder
 from .components.wav_encoder import WavEncoder
 from .talker import Talker, TalkerConfig
-from .utils.tokenizer import extract_last_assistant_embeds, tokenize_mask_assistant
+from .utils.tokenizer import (
+    CHAR_VOCAB_SIZE,
+    extract_last_assistant_char_aligned_embeds,
+    tokenize_mask_assistant,
+)
 
 
 @dataclass
@@ -71,7 +75,7 @@ class LlmSpokenModel(nn.Module):
     def __init__(self, config: LlmSpokenModelConfig, apply_peft: bool = True):
         super().__init__()
         self.config = config
-        
+
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model,
             # quantization_config = FineGrainedFP8Config()
@@ -105,6 +109,7 @@ class LlmSpokenModel(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(config.model)
         if config.template:
             self.tokenizer.chat_template = open(config.template).read()
+        self.config.talker.char_vocab_size = CHAR_VOCAB_SIZE
         self.talker = Talker(
             config.talker, device=self.model.device, dtype=self.model.dtype
         )
@@ -213,8 +218,15 @@ class LlmSpokenModel(nn.Module):
                 return_dict=True,
             )
             hidden_states = hidden_outputs.hidden_states[-1]
-            assistant_embeds, assistant_embeds_length = extract_last_assistant_embeds(
-                hidden_states, assistant_mask
+            (
+                assistant_embeds,
+                assistant_embeds_length,
+                assistant_char_ids,
+            ) = extract_last_assistant_char_aligned_embeds(
+                self.tokenizer,
+                input_ids,
+                hidden_states,
+                assistant_mask,
             )
 
         with torch.no_grad():
@@ -226,6 +238,7 @@ class LlmSpokenModel(nn.Module):
         outs = self.talker(
             assistant_embeds,
             assistant_embeds_length,
+            assistant_char_ids,
             audio_mels,
             audio_mel_lens,
         )

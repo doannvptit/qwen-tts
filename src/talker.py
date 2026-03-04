@@ -37,6 +37,7 @@ class TalkerConfig:
 
     delta: float
     look_ahead: int
+    char_vocab_size: int = 512
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -88,9 +89,12 @@ class Talker(nn.Module):
             postnet_kernel_size=cfg.post_net_kernel_size,
             postnet_n_convolutions=cfg.post_net_num_layers,
         )
+        self.char_embedding = nn.Embedding(cfg.char_vocab_size, cfg.input_dim)
         self.to(device=device, dtype=dtype)
 
-    def _expand_duration(self, duration_target, embeds_value, embeds_len, mel_lens=None):
+    def _expand_duration(
+        self, duration_target, embeds_value, embeds_len, mel_lens=None
+    ):
         reconst_alpha, reconst_mel_lens = reconstruct_align_from_aligned_position(
             duration_target,
             mel_lens=mel_lens,
@@ -108,9 +112,11 @@ class Talker(nn.Module):
         self,
         embeds: torch.Tensor,
         embeds_len: torch.Tensor,
+        char_ids: torch.Tensor,
         mels: torch.Tensor,
         mels_len: torch.Tensor,
     ):
+        embeds = embeds + self.char_embedding(char_ids)
         mel_mask = get_mask_from_lengths(mels_len, max_len=mels.size(1))
         embeds_key, embeds_value = self.embed_encoder(embeds, embeds_len)
         embeds_mask = get_mask_from_lengths(embeds_len)
