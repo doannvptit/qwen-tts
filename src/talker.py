@@ -158,3 +158,39 @@ class Talker(nn.Module):
             "mel_pred": mel_pred,
             "mel_post": mel_post,
         }
+
+    @torch.inference_mode()
+    def infer(
+        self,
+        embeds: torch.Tensor,
+        embeds_len: torch.Tensor,
+        char_ids: torch.Tensor,
+    ):
+        embeds = embeds + self.char_embedding(char_ids)
+        embeds_key, embeds_value = self.embed_encoder(embeds, embeds_len)
+        embeds_mask = get_mask_from_lengths(embeds_len, max_len=embeds.size(1))
+
+        duration_pred = self.duration_predictor(embeds_value, is_train=False)
+        duration_pred = duration_pred.masked_fill(embeds_mask, 0.0)
+
+        duration_step = torch.round(duration_pred)
+        duration_step = torch.clamp(duration_step, min=1.0)
+        duration_step = duration_step.masked_fill(embeds_mask, 0.0)
+        mel_lens = duration_step.sum(dim=-1).long()
+
+        embed_expanded, mel_lens = self._expand_duration(
+            duration_step,
+            embeds_value,
+            embeds_len,
+            mel_lens,
+        )
+        mel_pred = self.mel_decoder(embed_expanded)
+        mel_post = self.post_net(mel_pred)
+
+        return {
+            "duration_pred": duration_pred,
+            "duration_step": duration_step,
+            "mel_pred": mel_pred,
+            "mel_post": mel_post,
+            "mel_lens": mel_lens,
+        }

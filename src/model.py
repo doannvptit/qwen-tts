@@ -17,6 +17,7 @@ from .components.wav_encoder import WavEncoder
 from .talker import Talker, TalkerConfig
 from .utils.tokenizer import (
     CHAR_VOCAB_SIZE,
+    expand_token_embeds_to_chars,
     extract_last_assistant_char_aligned_embeds,
     tokenize_mask_assistant,
 )
@@ -252,3 +253,155 @@ class LlmSpokenModel(nn.Module):
                 for i in range(audio_preds.size(0))
             ]
         return outs
+
+    def _sample_next_token(
+        self,
+        logits: torch.Tensor,
+        temperature: float,
+        top_p: float,
+    ) -> torch.Tensor:
+        if temperature <= 0.0:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+
+        scaled_logits = logits / max(temperature, 1e-5)
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+            sorted_mask = cumulative_probs > top_p
+            sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+            sorted_mask[..., 0] = False
+
+            sorted_logits = sorted_logits.masked_fill(sorted_mask, -float("inf"))
+            probs = torch.softmax(sorted_logits, dim=-1)
+            sampled_sorted = torch.multinomial(probs, num_samples=1)
+            return sorted_indices.gather(-1, sampled_sorted)
+
+        probs = torch.softmax(scaled_logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
+    @torch.inference_mode()
+    def stream_generate_assistant(
+        self,
+        messages: list[dict],
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.95,
+        sample_rate: int = 24_000,
+    ):
+        model_device = next(self.model.parameters()).device
+        prompt_text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        model_inputs = self.tokenizer(prompt_text, return_tensors="pt")
+        input_ids = model_inputs["input_ids"].to(model_device)
+        attention_mask = model_inputs["attention_mask"].to(model_device)
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        past_key_values = outputs.past_key_values
+        next_token = self._sample_next_token(
+            outputs.logits[:, -1, :], temperature, top_p
+        )
+
+        eos_token_id = self.tokenizer.eos_token_id
+        generated_token_ids: list[int] = []
+        generated_token_embeds: list[torch.Tensor] = []
+        decoded_text = ""
+
+        while (
+            len(generated_token_ids) < max_new_tokens
+            and next_token.item() != eos_token_id
+        ):
+            token_id = int(next_token.item())
+            generated_token_ids.append(token_id)
+
+            attention_mask = torch.cat(
+                [
+                    attention_mask,
+                    torch.ones((1, 1), dtype=attention_mask.dtype, device=model_device),
+                ],
+                dim=1,
+            )
+            outputs = self.model(
+                input_ids=next_token,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            past_key_values = outputs.past_key_values
+            generated_token_embeds.append(outputs.hidden_states[-1][0, -1])
+
+            delta = self.tokenizer.decode(
+                [token_id],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            if delta:
+                decoded_text += delta
+                yield {
+                    "event": "text",
+                    "text": decoded_text,
+                }
+
+            next_token = self._sample_next_token(
+                outputs.logits[:, -1, :],
+                temperature,
+                top_p,
+            )
+
+        final_text = decoded_text.strip()
+        if not final_text:
+            final_text = "I could not generate a response. Please try again."
+
+        if not generated_token_embeds:
+            yield {
+                "event": "final",
+                "text": final_text,
+                "audio": None,
+                "sample_rate": sample_rate,
+            }
+            return
+
+        token_embed_tensor = torch.stack(generated_token_embeds, dim=0)
+        expanded_embeds, expanded_char_ids = expand_token_embeds_to_chars(
+            self.tokenizer,
+            generated_token_ids,
+            token_embed_tensor,
+        )
+        assistant_embeds = expanded_embeds.unsqueeze(0)
+        assistant_char_ids = expanded_char_ids.unsqueeze(0)
+        assistant_embeds_len = torch.tensor(
+            [expanded_embeds.size(0)],
+            dtype=torch.long,
+            device=expanded_embeds.device,
+        )
+
+        talker_outs = self.talker.infer(
+            assistant_embeds,
+            assistant_embeds_len,
+            assistant_char_ids,
+        )
+        mel_post = talker_outs["mel_post"].to(dtype=torch.float32)
+        mel_lens = talker_outs["mel_lens"]
+
+        self.wav_decoder = self.wav_decoder.to(mel_post.device)
+        audio_preds, audio_lens = self.wav_decoder.decode(mel_post, mel_lens)
+        audio = audio_preds[0, : int(audio_lens[0].item())].detach().cpu().numpy()
+
+        yield {
+            "event": "final",
+            "text": final_text,
+            "audio": audio,
+            "sample_rate": sample_rate,
+        }
