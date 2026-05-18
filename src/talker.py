@@ -117,6 +117,7 @@ class Talker(nn.Module):
         mels_len: torch.Tensor,
     ):
         embeds = embeds + self.char_embedding(char_ids)
+
         mel_mask = get_mask_from_lengths(mels_len, max_len=mels.size(1))
         embeds_key, embeds_value = self.embed_encoder(embeds, embeds_len)
         embeds_mask = get_mask_from_lengths(embeds_len)

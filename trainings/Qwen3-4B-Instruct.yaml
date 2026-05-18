@@ -18,10 +18,12 @@ model_config: ./configs/Qwen3-4B-Instruct.yaml
 training:
   output_dir: ./checkpoints/Qwen3-4B-Instruct
   num_train_epochs: 20
-  per_device_train_batch_size: 64
-  gradient_accumulation_steps: 1
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 8
   learning_rate: 1e-3
   weight_decay: 0.01
+  llm_loss_weight: 5.0
+  tts_loss_weight: 1.0
   warmup_ratio: 0.1
   logging_steps: 10
   save_steps: 1000

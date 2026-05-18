@@ -5,6 +5,7 @@ import torch
 from src.utils.tokenizer import (
     CHAR_TO_ID,
     CHAR_UNK_ID,
+    build_assistant_labels,
     extract_last_assistant_char_aligned_embeds,
 )
 
@@ -20,6 +21,27 @@ class DummyTokenizer:
 
 
 class TestCharAlignedEmbeds(unittest.TestCase):
+    def test_build_assistant_labels_masks_non_assistant_tokens(self):
+        input_ids = torch.tensor([[11, 12, 13, 14], [21, 22, 23, 24]], dtype=torch.long)
+        assistant_mask = torch.tensor(
+            [[False, True, True, False], [False, False, True, False]],
+            dtype=torch.bool,
+        )
+
+        labels = build_assistant_labels(input_ids, assistant_mask)
+
+        expected = torch.tensor(
+            [[-100, 12, 13, -100], [-100, -100, 23, -100]], dtype=torch.long
+        )
+        self.assertTrue(torch.equal(labels, expected))
+
+    def test_build_assistant_labels_raises_on_shape_mismatch(self):
+        input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+        assistant_mask = torch.tensor([[True, False]], dtype=torch.bool)
+
+        with self.assertRaises(ValueError):
+            build_assistant_labels(input_ids, assistant_mask)
+
     def test_repeat_embed_by_decoded_char_count_and_map_char_ids(self):
         tokenizer = DummyTokenizer({10: "xin", 11: " chào"})
 

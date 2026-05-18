@@ -94,6 +94,24 @@ def tokenize_mask_assistant(tokenizer, messages_batch):
     return input_ids, attention_mask, assistant_mask
 
 
+def build_assistant_labels(
+    input_ids: torch.Tensor,
+    assistant_mask: torch.Tensor,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    assistant_mask = torch.as_tensor(
+        assistant_mask,
+        dtype=torch.bool,
+        device=input_ids.device,
+    )
+    if assistant_mask.shape != input_ids.shape:
+        raise ValueError("assistant mask shape mismatch")
+
+    labels = input_ids.clone()
+    labels.masked_fill_(~assistant_mask, ignore_index)
+    return labels
+
+
 def extract_last_assistant_embeds(hidden_states, assistant_mask):
     """
     Extract last assistant embeds from hidden states.

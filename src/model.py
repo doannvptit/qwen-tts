@@ -17,6 +17,7 @@ from .components.wav_encoder import WavEncoder
 from .talker import Talker, TalkerConfig
 from .utils.tokenizer import (
     CHAR_VOCAB_SIZE,
+    build_assistant_labels,
     expand_token_embeds_to_chars,
     extract_last_assistant_char_aligned_embeds,
     tokenize_mask_assistant,
@@ -211,13 +212,17 @@ class LlmSpokenModel(nn.Module):
             input_ids = input_ids.to(model_device)
             attention_mask = attention_mask.to(model_device)
             assistant_mask = assistant_mask.to(model_device)
+            labels = build_assistant_labels(input_ids, assistant_mask)
             input_embeds = self.model.get_input_embeddings()(input_ids)
+
             hidden_outputs = self.model(
                 inputs_embeds=input_embeds,
                 attention_mask=attention_mask,
+                labels=labels,
                 output_hidden_states=True,
                 return_dict=True,
             )
+            llm_loss = hidden_outputs.loss
             hidden_states = hidden_outputs.hidden_states[-1]
             (
                 assistant_embeds,
@@ -228,6 +233,9 @@ class LlmSpokenModel(nn.Module):
                 input_ids,
                 hidden_states,
                 assistant_mask,
+            )
+            print(
+                f"Assistant embeds shape: {assistant_embeds.shape}, assistant_embeds_length: {assistant_embeds_length}, assistant_char_ids shape: {assistant_char_ids.shape}"
             )
 
         with torch.no_grad():
@@ -243,6 +251,7 @@ class LlmSpokenModel(nn.Module):
             audio_mels,
             audio_mel_lens,
         )
+        outs["llm_loss"] = llm_loss
 
         if output_audio_list:
             mel_post = outs["mel_post"].to(dtype=torch.float32)
