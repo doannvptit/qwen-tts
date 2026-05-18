@@ -12,3 +12,5 @@ wheels/
 # Runtime
 wandb
 checkpoints
+*.log
+.ruff_cache

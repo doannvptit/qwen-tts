@@ -1,6 +1,64 @@
 import torch
 
 
+CHAR_VOCAB = (
+    " "
+    "0123456789"
+    "abcdefghijklmnopqrstuvwxyz"
+    "àáảãạăằắẳẵặâầấẩẫậ"
+    "èéẻẽẹêềếểễệ"
+    "ìíỉĩị"
+    "òóỏõọôồốổỗộơờớởỡợ"
+    "ùúủũụưừứửữự"
+    "ỳýỷỹỵ"
+    "đ"
+    "ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬ"
+    "ÈÉẺẼẸÊỀẾỂỄỆ"
+    "ÌÍỈĨỊ"
+    "ÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢ"
+    "ÙÚỦŨỤƯỪỨỬỮỰ"
+    "ỲÝỶỸỴ"
+    "Đ"
+    ".,!?;:-_'\"()/[]{}@#$%&*+=<>|\\\n\t"
+)
+CHAR_PAD_ID = 0
+CHAR_UNK_ID = 1
+CHAR_TO_ID = {ch: idx + 2 for idx, ch in enumerate(CHAR_VOCAB)}
+CHAR_VOCAB_SIZE = len(CHAR_TO_ID) + 2
+
+
+def expand_token_embeds_to_chars(
+    tokenizer,
+    token_ids: list[int],
+    token_embeds: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    sample_embeds = []
+    sample_char_ids = []
+
+    for token_id, embed in zip(token_ids, token_embeds):
+        token_text = tokenizer.decode(
+            [token_id],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        if not token_text:
+            sample_embeds.append(embed.unsqueeze(0))
+            sample_char_ids.append(CHAR_UNK_ID)
+            continue
+
+        chars = list(token_text)
+        sample_embeds.append(embed.unsqueeze(0).repeat(len(chars), 1))
+        sample_char_ids.extend(CHAR_TO_ID.get(ch, CHAR_UNK_ID) for ch in chars)
+
+    expanded_embeds = torch.cat(sample_embeds, dim=0)
+    expanded_char_ids = torch.tensor(
+        sample_char_ids,
+        dtype=torch.long,
+        device=token_embeds.device,
+    )
+    return expanded_embeds, expanded_char_ids
+
+
 def tokenize_mask_assistant(tokenizer, messages_batch):
     """
     Tokenize and mask assistant messages in a batch of conversations.
@@ -34,6 +92,24 @@ def tokenize_mask_assistant(tokenizer, messages_batch):
     if assistant_mask.shape != input_ids.shape:
         raise ValueError("assistant mask shape mismatch")
     return input_ids, attention_mask, assistant_mask
+
+
+def build_assistant_labels(
+    input_ids: torch.Tensor,
+    assistant_mask: torch.Tensor,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    assistant_mask = torch.as_tensor(
+        assistant_mask,
+        dtype=torch.bool,
+        device=input_ids.device,
+    )
+    if assistant_mask.shape != input_ids.shape:
+        raise ValueError("assistant mask shape mismatch")
+
+    labels = input_ids.clone()
+    labels.masked_fill_(~assistant_mask, ignore_index)
+    return labels
 
 
 def extract_last_assistant_embeds(hidden_states, assistant_mask):
@@ -80,3 +156,64 @@ def extract_last_assistant_embeds(hidden_states, assistant_mask):
 
     lengths = torch.tensor(span_lengths, dtype=torch.long, device=hidden_states.device)
     return output, lengths
+
+
+def extract_last_assistant_char_aligned_embeds(
+    tokenizer,
+    input_ids: torch.Tensor,
+    hidden_states: torch.Tensor,
+    assistant_mask: torch.Tensor,
+):
+    assistant_mask = assistant_mask.to(dtype=torch.bool, device=hidden_states.device)
+
+    batch_size, _, hidden_dim = hidden_states.shape
+    expanded_embeds = []
+    expanded_char_ids = []
+    span_lengths = []
+
+    for batch_idx in range(batch_size):
+        mask_row = assistant_mask[batch_idx]
+        indices = torch.nonzero(mask_row, as_tuple=False).squeeze(-1)
+
+        if indices.numel() == 0:
+            raise ValueError(
+                f"No assistant tokens found for sample {batch_idx}. "
+                "Ensure each conversation contains at least one assistant message."
+            )
+
+        end_idx = indices[-1].item()
+        start_idx = end_idx
+        while start_idx > 0 and mask_row[start_idx - 1]:
+            start_idx -= 1
+
+        span_embed = hidden_states[batch_idx, start_idx : end_idx + 1]
+        span_ids = input_ids[batch_idx, start_idx : end_idx + 1]
+
+        sample_embeds_tensor, sample_char_ids_tensor = expand_token_embeds_to_chars(
+            tokenizer,
+            span_ids.tolist(),
+            span_embed,
+        )
+
+        expanded_embeds.append(sample_embeds_tensor)
+        expanded_char_ids.append(sample_char_ids_tensor)
+        span_lengths.append(sample_embeds_tensor.size(0))
+
+    max_len = max(span_lengths)
+    output_embeds = hidden_states.new_zeros((batch_size, max_len, hidden_dim))
+    output_char_ids = torch.full(
+        (batch_size, max_len),
+        fill_value=CHAR_PAD_ID,
+        dtype=torch.long,
+        device=hidden_states.device,
+    )
+
+    for batch_idx, (sample_embed, sample_char_ids) in enumerate(
+        zip(expanded_embeds, expanded_char_ids)
+    ):
+        sample_len = sample_embed.size(0)
+        output_embeds[batch_idx, :sample_len] = sample_embed
+        output_char_ids[batch_idx, :sample_len] = sample_char_ids
+
+    lengths = torch.tensor(span_lengths, dtype=torch.long, device=hidden_states.device)
+    return output_embeds, lengths, output_char_ids

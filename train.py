@@ -1,6 +1,7 @@
 import argparse
 import math
 import random
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,7 +18,28 @@ from transformers import get_scheduler
 
 from src.model import LlmSpokenModel, LlmSpokenModelConfig
 
-SYSTEM_PROMPT = "say exactly provided sentence"
+SYSTEM_PROMPTS = [
+    "say exactly provided sentence",
+    "repeat the following sentence",
+    "please say the following sentence",
+    "say the sentence exactly as given",
+    "repeat exactly what is written below",
+    "please repeat the sentence verbatim",
+    "say the following text exactly",
+    "repeat the provided sentence exactly",
+    "speak the sentence exactly as written",
+    "read and repeat the following sentence",
+    "please repeat exactly the given sentence",
+    "say precisely the provided sentence",
+    "repeat word for word the following sentence",
+    "please say exactly what is written",
+    "read the sentence and repeat it exactly",
+    "repeat the sentence without any changes",
+    "say the exact sentence provided",
+    "please repeat the exact sentence below",
+    "repeat exactly the sentence given",
+    "speak exactly the following sentence",
+]
 TEXT_COLUMN = "transcription"
 AUDIO_COLUMN = "audio"
 DEFAULT_SPLIT = "train"
@@ -40,9 +62,12 @@ class TrainingConfig:
     gradient_accumulation_steps: int
     learning_rate: float
     weight_decay: float
+    llm_loss_weight: float
+    tts_loss_weight: float
     warmup_ratio: float
     logging_steps: int
     save_steps: int
+    keep_last_n_checkpoints: int
     audio_dump_steps: int
     audio_dump_num_samples: int
     seed: int
@@ -60,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=str,
-        default="trainings/qwen3_4b.yaml",
+        default="trainings/Qwen3-4B-Instruct.yaml",
         help="Path to training yaml config.",
     )
     return parser.parse_args()
@@ -97,9 +122,12 @@ def load_run_config(config_path: Path) -> tuple[RunConfig, dict]:
         gradient_accumulation_steps=int(train_raw["gradient_accumulation_steps"]),
         learning_rate=float(train_raw["learning_rate"]),
         weight_decay=float(train_raw["weight_decay"]),
+        llm_loss_weight=float(train_raw.get("llm_loss_weight", 1.0)),
+        tts_loss_weight=float(train_raw.get("tts_loss_weight", 1.0)),
         warmup_ratio=float(train_raw["warmup_ratio"]),
         logging_steps=int(train_raw["logging_steps"]),
         save_steps=int(train_raw["save_steps"]),
+        keep_last_n_checkpoints=int(train_raw.get("keep_last_n_checkpoints", 0)),
         audio_dump_steps=int(train_raw.get("audio_dump_steps", 0)),
         audio_dump_num_samples=int(train_raw.get("audio_dump_num_samples", 2)),
         seed=int(train_raw["seed"]),
@@ -110,10 +138,20 @@ def load_run_config(config_path: Path) -> tuple[RunConfig, dict]:
         raise ValueError("logging_steps must be >= 1")
     if training_cfg.save_steps < 1:
         raise ValueError("save_steps must be >= 1")
+    if training_cfg.keep_last_n_checkpoints < 0:
+        raise ValueError("keep_last_n_checkpoints must be >= 0")
     if training_cfg.audio_dump_steps < 0:
         raise ValueError("audio_dump_steps must be >= 0")
     if training_cfg.audio_dump_num_samples < 1:
         raise ValueError("audio_dump_num_samples must be >= 1")
+    if training_cfg.llm_loss_weight < 0:
+        raise ValueError("llm_loss_weight must be >= 0")
+    if training_cfg.tts_loss_weight < 0:
+        raise ValueError("tts_loss_weight must be >= 0")
+    if training_cfg.llm_loss_weight == 0 and training_cfg.tts_loss_weight == 0:
+        raise ValueError(
+            "At least one of llm_loss_weight or tts_loss_weight must be > 0"
+        )
 
     raw_model_config_path = Path(raw["model_config"])
     if raw_model_config_path.is_absolute():
@@ -156,15 +194,20 @@ def collate_batch(samples: list[dict]) -> dict:
     audio_batch = []
 
     for sample in samples:
+        audio = _audio_to_numpy(sample[AUDIO_COLUMN])
         text = str(sample[TEXT_COLUMN])
+
+        if len(text) < 10 or len(audio) < 24000:
+            print(f"Skipping sample with text length {len(text)} and audio length {len(audio)}")
+            continue
         messages_batch.append(
             [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": random.choice(SYSTEM_PROMPTS)},
                 {"role": "user", "content": text},
-                {"role": "assistant", "content": text},
+                {"role": "assistant", "content": text.lower().strip()}, # TODO: is this necessary to lowercase?
             ]
         )
-        audio_batch.append(_audio_to_numpy(sample[AUDIO_COLUMN]))
+        audio_batch.append(audio)
 
     return {
         "messages_batch": messages_batch,
@@ -179,6 +222,7 @@ def save_checkpoint(
     optimizer: AdamW,
     scheduler,
     epoch: int,
+    keep_last_n_checkpoints: int,
 ) -> None:
     ckpt_dir = output_dir / f"step_{global_step}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -194,6 +238,23 @@ def save_checkpoint(
         },
         ckpt_dir / "trainer_state.pt",
     )
+
+    if keep_last_n_checkpoints > 0:
+        checkpoint_dirs: list[tuple[int, Path]] = []
+        for path in output_dir.glob("step_*"):
+            if not path.is_dir():
+                continue
+            if not path.name.startswith("step_"):
+                continue
+            step_str = path.name[len("step_") :]
+            if not step_str.isdigit():
+                continue
+            checkpoint_dirs.append((int(step_str), path))
+
+        checkpoint_dirs.sort(key=lambda item: item[0])
+        stale_dirs = checkpoint_dirs[:-keep_last_n_checkpoints]
+        for _, stale_dir in stale_dirs:
+            shutil.rmtree(stale_dir, ignore_errors=False)
 
 
 def save_debug_audios(
@@ -239,8 +300,16 @@ def main() -> None:
     model_cfg = LlmSpokenModelConfig.from_yaml(cfg.model_config)
     model = LlmSpokenModel(model_cfg)
     model.to(device)
-    model.model.eval()
-    model.talker.train()
+    model.setup_for_training()
+
+    use_llm_loss = model.peft_enabled
+    effective_llm_loss_weight = cfg.training.llm_loss_weight if use_llm_loss else 0.0
+    if cfg.training.llm_loss_weight > 0 and not use_llm_loss:
+        print("LLM is frozen (PEFT disabled): llm_loss_weight is ignored.")
+    if effective_llm_loss_weight == 0 and cfg.training.tts_loss_weight == 0:
+        raise ValueError(
+            "No trainable objective: tts_loss_weight and effective llm_loss_weight are both 0"
+        )
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"trainable_params={trainable_params:,}")
@@ -255,7 +324,7 @@ def main() -> None:
     )
 
     optimizer = AdamW(
-        model.talker.parameters(),
+        model.optimizer_param_groups(),
         lr=cfg.training.learning_rate,
         weight_decay=cfg.training.weight_decay,
     )
@@ -300,14 +369,21 @@ def main() -> None:
                 output_audio_list=should_dump_audio,
             )
 
-            total_loss = (
+            tts_loss = (
                 outputs["mel_pred_loss"]
                 + outputs["mel_post_loss"]
                 + outputs["duration_loss"]
             )
+            llm_loss = outputs["llm_loss"]
+            weighted_tts_loss = cfg.training.tts_loss_weight * tts_loss
+            weighted_llm_loss = effective_llm_loss_weight * llm_loss
+            total_loss = weighted_tts_loss + weighted_llm_loss
+            print(f"Llm Loss: {llm_loss.item()}, Tts Loss: {tts_loss.item()}, Total Loss: {total_loss.item()}")
+
             (total_loss / cfg.training.gradient_accumulation_steps).backward()
 
             if step % cfg.training.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -315,6 +391,11 @@ def main() -> None:
 
                 log_payload = {
                     "loss/total": float(total_loss.item()),
+                    "loss/tts": float(tts_loss.item()),
+                    "loss/llm": float(llm_loss.item()),
+                    "loss/weighted_tts": float(weighted_tts_loss.item()),
+                    "loss/weighted_llm": float(weighted_llm_loss.item()),
+                    "train/use_llm_loss": float(use_llm_loss),
                     "loss/mel_pred": float(outputs["mel_pred_loss"].item()),
                     "loss/mel_post": float(outputs["mel_post_loss"].item()),
                     "loss/duration": float(outputs["duration_loss"].item()),
@@ -333,6 +414,8 @@ def main() -> None:
                     print(
                         f"step={global_step} "
                         f"loss={log_payload['loss/total']:.4f} "
+                        f"tts={log_payload['loss/tts']:.4f} "
+                        f"llm={log_payload['loss/llm']:.4f} "
                         f"mel_pred={log_payload['loss/mel_pred']:.4f} "
                         f"mel_post={log_payload['loss/mel_post']:.4f} "
                         f"duration={log_payload['loss/duration']:.4f} "
@@ -341,7 +424,13 @@ def main() -> None:
 
                 if global_step % cfg.training.save_steps == 0:
                     save_checkpoint(
-                        output_dir, global_step, model, optimizer, scheduler, epoch
+                        output_dir,
+                        global_step,
+                        model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        cfg.training.keep_last_n_checkpoints,
                     )
 
                 if should_dump_audio:
@@ -367,6 +456,7 @@ def main() -> None:
         optimizer=optimizer,
         scheduler=scheduler,
         epoch=cfg.training.num_train_epochs,
+        keep_last_n_checkpoints=cfg.training.keep_last_n_checkpoints,
     )
     wandb.finish()
 

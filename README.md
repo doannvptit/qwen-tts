@@ -76,6 +76,7 @@ python train.py --config trainings/qwen3_4b.yaml
 ## Training outputs
 
 - Checkpoints are saved to `training.output_dir` (default: `checkpoints/qwen3_4b`).
+- Set `training.keep_last_n_checkpoints` to keep only the most recent N checkpoints (`0` keeps all).
 - Model snapshot includes:
   - `model/config.yaml`
   - `model/talker.safetensors`
@@ -89,3 +90,17 @@ python train.py --config trainings/qwen3_4b.yaml
 This repository currently focuses on training the speech head from teacher-forced assistant text.
 
 It is not yet a production real-time, streaming, fully full-duplex system, but it is designed as a clean foundation for that direction.
+
+## Gradio demo (multi-turn text + audio)
+
+You can run an interactive chat demo that streams assistant text first, then synthesizes assistant audio from the generated turn.
+
+```bash
+python demo_gradio.py --checkpoint checkpoints/<your-step>/model
+```
+
+Useful flags:
+
+- `--system-prompt "..."` to set behavior.
+- `--device auto|cuda|cpu` to select runtime device.
+- `--server-name` and `--server-port` for hosting.
