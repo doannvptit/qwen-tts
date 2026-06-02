@@ -1,5 +1,6 @@
 import argparse
 import math
+import os
 import random
 import shutil
 from dataclasses import dataclass
@@ -7,12 +8,15 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torchaudio
 import wandb
 import yaml
 from datasets import Audio, concatenate_datasets, load_dataset
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 from transformers import get_scheduler
 
@@ -85,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=str,
-        default="trainings/Qwen3-4B-Instruct.yaml",
+        default="trainings/Qwen3-0.6B-Instruct.yaml",
         help="Path to training yaml config.",
     )
     return parser.parse_args()
@@ -227,7 +231,8 @@ def save_checkpoint(
     ckpt_dir = output_dir / f"step_{global_step}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    model.save_pretrained(ckpt_dir / "model")
+    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+    raw_model.save_pretrained(ckpt_dir / "model")
 
     torch.save(
         {
@@ -291,8 +296,28 @@ def main() -> None:
     config_path = Path(args.config).resolve()
     cfg, raw_cfg = load_run_config(config_path)
 
-    set_seed(cfg.training.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    is_distributed = "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1
+    if is_distributed:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        local_rank = 0
+        rank = 0
+        world_size = 1
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    is_main = rank == 0
+    set_seed(cfg.training.seed + rank)
+
+    if is_main:
+        output_dir = Path(cfg.training.output_dir).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+    if is_distributed:
+        dist.barrier()
 
     output_dir = Path(cfg.training.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -304,27 +329,53 @@ def main() -> None:
 
     use_llm_loss = model.peft_enabled
     effective_llm_loss_weight = cfg.training.llm_loss_weight if use_llm_loss else 0.0
-    if cfg.training.llm_loss_weight > 0 and not use_llm_loss:
+    if is_main and cfg.training.llm_loss_weight > 0 and not use_llm_loss:
         print("LLM is frozen (PEFT disabled): llm_loss_weight is ignored.")
     if effective_llm_loss_weight == 0 and cfg.training.tts_loss_weight == 0:
         raise ValueError(
             "No trainable objective: tts_loss_weight and effective llm_loss_weight are both 0"
         )
 
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"trainable_params={trainable_params:,}")
+    if is_distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
 
-    train_dataset = load_train_dataset(cfg.datasets, cfg.training.seed)
+    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if is_main:
+        print(f"trainable_params={trainable_params:,}")
+        print(
+            f"distributed: world_size={world_size} rank={rank} local_rank={local_rank}"
+        )
+
+    train_dataset = load_train_dataset(cfg.datasets, cfg.training.seed + rank)
+    if is_distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=cfg.training.seed,
+            drop_last=False,
+        )
+    else:
+        train_sampler = None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.training.per_device_train_batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         collate_fn=collate_batch,
         drop_last=False,
     )
 
     optimizer = AdamW(
-        model.optimizer_param_groups(),
+        raw_model.optimizer_param_groups(),
         lr=cfg.training.learning_rate,
         weight_decay=cfg.training.weight_decay,
     )
@@ -341,19 +392,26 @@ def main() -> None:
         num_training_steps=total_training_steps,
     )
 
-    wandb.init(
-        project="llm-spoken",
-        name=f"train-{config_path.stem}",
-        config=raw_cfg,
-    )
+    if is_main:
+        wandb.init(
+            project="llm-spoken",
+            name=f"train-{config_path.stem}",
+            config=raw_cfg,
+        )
 
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(cfg.training.num_train_epochs):
-        progress = tqdm(
-            train_loader, desc=f"Epoch {epoch + 1}/{cfg.training.num_train_epochs}"
-        )
+        if is_distributed:
+            train_sampler.set_epoch(epoch)
+        if is_main:
+            progress = tqdm(
+                train_loader, desc=f"Epoch {epoch + 1}/{cfg.training.num_train_epochs}"
+            )
+        else:
+            progress = train_loader
+
         for step, batch in enumerate(progress, start=1):
             will_update = step % cfg.training.gradient_accumulation_steps == 0
             next_global_step = global_step + 1 if will_update else global_step
@@ -366,7 +424,7 @@ def main() -> None:
             outputs = model(
                 messages_batch=batch["messages_batch"],
                 audio_batch=batch["audio_batch"],
-                output_audio_list=should_dump_audio,
+                output_audio_list=should_dump_audio and is_main,
             )
 
             tts_loss = (
@@ -378,7 +436,10 @@ def main() -> None:
             weighted_tts_loss = cfg.training.tts_loss_weight * tts_loss
             weighted_llm_loss = effective_llm_loss_weight * llm_loss
             total_loss = weighted_tts_loss + weighted_llm_loss
-            print(f"Llm Loss: {llm_loss.item()}, Tts Loss: {tts_loss.item()}, Total Loss: {total_loss.item()}")
+            if is_main:
+                print(
+                    f"Llm Loss: {llm_loss.item()}, Tts Loss: {tts_loss.item()}, Total Loss: {total_loss.item()}"
+                )
 
             (total_loss / cfg.training.gradient_accumulation_steps).backward()
 
@@ -389,59 +450,60 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-                log_payload = {
-                    "loss/total": float(total_loss.item()),
-                    "loss/tts": float(tts_loss.item()),
-                    "loss/llm": float(llm_loss.item()),
-                    "loss/weighted_tts": float(weighted_tts_loss.item()),
-                    "loss/weighted_llm": float(weighted_llm_loss.item()),
-                    "train/use_llm_loss": float(use_llm_loss),
-                    "loss/mel_pred": float(outputs["mel_pred_loss"].item()),
-                    "loss/mel_post": float(outputs["mel_post_loss"].item()),
-                    "loss/duration": float(outputs["duration_loss"].item()),
-                    "train/epoch": epoch + 1,
-                    "train/step": global_step,
-                    "train/lr": float(scheduler.get_last_lr()[0]),
-                }
-                wandb.log(log_payload, step=global_step)
+                if is_main:
+                    log_payload = {
+                        "loss/total": float(total_loss.item()),
+                        "loss/tts": float(tts_loss.item()),
+                        "loss/llm": float(llm_loss.item()),
+                        "loss/weighted_tts": float(weighted_tts_loss.item()),
+                        "loss/weighted_llm": float(weighted_llm_loss.item()),
+                        "train/use_llm_loss": float(use_llm_loss),
+                        "loss/mel_pred": float(outputs["mel_pred_loss"].item()),
+                        "loss/mel_post": float(outputs["mel_post_loss"].item()),
+                        "loss/duration": float(outputs["duration_loss"].item()),
+                        "train/epoch": epoch + 1,
+                        "train/step": global_step,
+                        "train/lr": float(scheduler.get_last_lr()[0]),
+                    }
+                    wandb.log(log_payload, step=global_step)
 
-                progress.set_postfix(
-                    loss=f"{log_payload['loss/total']:.4f}",
-                    step=global_step,
-                )
-
-                if global_step % cfg.training.logging_steps == 0:
-                    print(
-                        f"step={global_step} "
-                        f"loss={log_payload['loss/total']:.4f} "
-                        f"tts={log_payload['loss/tts']:.4f} "
-                        f"llm={log_payload['loss/llm']:.4f} "
-                        f"mel_pred={log_payload['loss/mel_pred']:.4f} "
-                        f"mel_post={log_payload['loss/mel_post']:.4f} "
-                        f"duration={log_payload['loss/duration']:.4f} "
-                        f"lr={log_payload['train/lr']:.6e}"
+                    progress.set_postfix(
+                        loss=f"{log_payload['loss/total']:.4f}",
+                        step=global_step,
                     )
 
-                if global_step % cfg.training.save_steps == 0:
-                    save_checkpoint(
-                        output_dir,
-                        global_step,
-                        model,
-                        optimizer,
-                        scheduler,
-                        epoch,
-                        cfg.training.keep_last_n_checkpoints,
-                    )
+                    if global_step % cfg.training.logging_steps == 0:
+                        print(
+                            f"step={global_step} "
+                            f"loss={log_payload['loss/total']:.4f} "
+                            f"tts={log_payload['loss/tts']:.4f} "
+                            f"llm={log_payload['loss/llm']:.4f} "
+                            f"mel_pred={log_payload['loss/mel_pred']:.4f} "
+                            f"mel_post={log_payload['loss/mel_post']:.4f} "
+                            f"duration={log_payload['loss/duration']:.4f} "
+                            f"lr={log_payload['train/lr']:.6e}"
+                        )
 
-                if should_dump_audio:
-                    print("Dumping audio...")
-                    save_debug_audios(
-                        output_dir=output_dir,
-                        global_step=global_step,
-                        predicted_audio_list=outputs["audio_list"],
-                        target_audio_list=batch["audio_batch"],
-                        max_samples=cfg.training.audio_dump_num_samples,
-                    )
+                    if global_step % cfg.training.save_steps == 0:
+                        save_checkpoint(
+                            output_dir,
+                            global_step,
+                            model,
+                            optimizer,
+                            scheduler,
+                            epoch,
+                            cfg.training.keep_last_n_checkpoints,
+                        )
+
+                    if should_dump_audio:
+                        print("Dumping audio...")
+                        save_debug_audios(
+                            output_dir=output_dir,
+                            global_step=global_step,
+                            predicted_audio_list=outputs["audio_list"],
+                            target_audio_list=batch["audio_batch"],
+                            max_samples=cfg.training.audio_dump_num_samples,
+                        )
 
         if len(train_loader) % cfg.training.gradient_accumulation_steps != 0:
             optimizer.step()
@@ -449,16 +511,20 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
 
-    save_checkpoint(
-        output_dir=output_dir,
-        global_step=global_step,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        epoch=cfg.training.num_train_epochs,
-        keep_last_n_checkpoints=cfg.training.keep_last_n_checkpoints,
-    )
-    wandb.finish()
+    if is_main:
+        save_checkpoint(
+            output_dir=output_dir,
+            global_step=global_step,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=cfg.training.num_train_epochs,
+            keep_last_n_checkpoints=cfg.training.keep_last_n_checkpoints,
+        )
+        wandb.finish()
+
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
