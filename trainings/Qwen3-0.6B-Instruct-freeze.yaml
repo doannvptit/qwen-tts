@@ -30,3 +30,7 @@ training:
   audio_dump_steps: 1000
   audio_dump_num_samples: 10
   seed: 42
+  discriminator_learning_rate: 2e-4
+  discriminator_warmup_steps: 10000
+  discriminator_loss_weight: 1.0
+  feature_matching_loss_weight: 1.0

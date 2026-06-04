@@ -4,6 +4,7 @@ import os
 os.environ["HF_DATASETS_CACHE"] = "/data"
 import random
 import shutil
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -76,6 +77,10 @@ class TrainingConfig:
     audio_dump_steps: int
     audio_dump_num_samples: int
     seed: int
+    discriminator_learning_rate: float
+    discriminator_warmup_steps: int
+    discriminator_loss_weight: float
+    feature_matching_loss_weight: float
 
 
 @dataclass
@@ -136,6 +141,18 @@ def load_run_config(config_path: Path) -> tuple[RunConfig, dict]:
         audio_dump_steps=int(train_raw.get("audio_dump_steps", 0)),
         audio_dump_num_samples=int(train_raw.get("audio_dump_num_samples", 2)),
         seed=int(train_raw["seed"]),
+        discriminator_learning_rate=float(
+            train_raw.get("discriminator_learning_rate", 2e-4)
+        ),
+        discriminator_warmup_steps=int(
+            train_raw.get("discriminator_warmup_steps", 10000)
+        ),
+        discriminator_loss_weight=float(
+            train_raw.get("discriminator_loss_weight", 1.0)
+        ),
+        feature_matching_loss_weight=float(
+            train_raw.get("feature_matching_loss_weight", 1.0)
+        ),
     )
     if training_cfg.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be >= 1")
@@ -157,6 +174,14 @@ def load_run_config(config_path: Path) -> tuple[RunConfig, dict]:
         raise ValueError(
             "At least one of llm_loss_weight or tts_loss_weight must be > 0"
         )
+    if training_cfg.discriminator_warmup_steps < 0:
+        raise ValueError("discriminator_warmup_steps must be >= 0")
+    if training_cfg.discriminator_loss_weight < 0:
+        raise ValueError("discriminator_loss_weight must be >= 0")
+    if training_cfg.feature_matching_loss_weight < 0:
+        raise ValueError("feature_matching_loss_weight must be >= 0")
+    if training_cfg.discriminator_learning_rate < 0:
+        raise ValueError("discriminator_learning_rate must be >= 0")
 
     raw_model_config_path = Path(raw["model_config"])
     if raw_model_config_path.is_absolute():
@@ -228,6 +253,8 @@ def save_checkpoint(
     scheduler,
     epoch: int,
     keep_last_n_checkpoints: int,
+    disc_optimizer: AdamW | None = None,
+    disc_scheduler=None,
 ) -> None:
     ckpt_dir = output_dir / f"step_{global_step}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -235,15 +262,17 @@ def save_checkpoint(
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
     raw_model.save_pretrained(ckpt_dir / "model")
 
-    torch.save(
-        {
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "global_step": global_step,
-            "epoch": epoch,
-        },
-        ckpt_dir / "trainer_state.pt",
-    )
+    state = {
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "global_step": global_step,
+        "epoch": epoch,
+    }
+    if disc_optimizer is not None:
+        state["disc_optimizer"] = disc_optimizer.state_dict()
+    if disc_scheduler is not None:
+        state["disc_scheduler"] = disc_scheduler.state_dict()
+    torch.save(state, ckpt_dir / "trainer_state.pt")
 
     if keep_last_n_checkpoints > 0:
         checkpoint_dirs: list[tuple[int, Path]] = []
@@ -381,6 +410,12 @@ def main() -> None:
         weight_decay=cfg.training.weight_decay,
     )
 
+    disc_optimizer = AdamW(
+        raw_model.discriminator_param_groups(),
+        lr=cfg.training.discriminator_learning_rate,
+        weight_decay=cfg.training.weight_decay,
+    )
+
     updates_per_epoch = math.ceil(
         len(train_loader) / max(cfg.training.gradient_accumulation_steps, 1)
     )
@@ -390,6 +425,15 @@ def main() -> None:
         name="linear",
         optimizer=optimizer,
         num_warmup_steps=warmup_steps,
+        num_training_steps=total_training_steps,
+    )
+    disc_warmup_steps = max(
+        cfg.training.discriminator_warmup_steps - warmup_steps, 0
+    )
+    disc_scheduler = get_scheduler(
+        name="linear",
+        optimizer=disc_optimizer,
+        num_warmup_steps=disc_warmup_steps,
         num_training_steps=total_training_steps,
     )
 
@@ -402,6 +446,7 @@ def main() -> None:
 
     global_step = 0
     optimizer.zero_grad(set_to_none=True)
+    disc_optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(cfg.training.num_train_epochs):
         if is_distributed:
@@ -434,22 +479,54 @@ def main() -> None:
                 + outputs["duration_loss"]
             )
             llm_loss = outputs["llm_loss"]
+            adv_loss = outputs["adv_loss"]
+            feat_match_loss = outputs["feat_match_loss"]
             weighted_tts_loss = cfg.training.tts_loss_weight * tts_loss
             weighted_llm_loss = effective_llm_loss_weight * llm_loss
-            total_loss = weighted_tts_loss + weighted_llm_loss
+            weighted_adv_loss = cfg.training.discriminator_loss_weight * adv_loss
+            weighted_fm_loss = (
+                cfg.training.feature_matching_loss_weight * feat_match_loss
+            )
+            total_loss = (
+                weighted_tts_loss
+                + weighted_llm_loss
+                + weighted_adv_loss
+                + weighted_fm_loss
+            )
             if is_main:
                 print(
-                    f"Llm Loss: {llm_loss.item()}, Tts Loss: {tts_loss.item()}, Total Loss: {total_loss.item()}"
+                    f"Llm Loss: {llm_loss.item()}, Tts Loss: {tts_loss.item()}, "
+                    f"Adv Loss: {adv_loss.item()}, FM Loss: {feat_match_loss.item()}, "
+                    f"Total Loss: {total_loss.item()}"
                 )
 
-            (total_loss / cfg.training.gradient_accumulation_steps).backward()
+            d_loss = raw_model.discriminator_step(
+                outputs["mel_post"], outputs["audio_mels"]
+            )
 
-            if step % cfg.training.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            sync_context = (
+                model.no_sync() if (is_distributed and not will_update) else nullcontext()
+            )
+            with sync_context:
+                if d_loss is not None:
+                    (d_loss / cfg.training.gradient_accumulation_steps).backward()
+                (total_loss / cfg.training.gradient_accumulation_steps).backward()
+
+            if will_update:
+                torch.nn.utils.clip_grad_norm_(
+                    raw_model.generator_parameters(), 1.0
+                )
+                torch.nn.utils.clip_grad_norm_(
+                    raw_model.discriminator.parameters(), 1.0
+                )
                 optimizer.step()
+                disc_optimizer.step()
                 scheduler.step()
+                disc_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                disc_optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                raw_model.disc_step.fill_(global_step)
 
                 if is_main:
                     log_payload = {
@@ -458,13 +535,20 @@ def main() -> None:
                         "loss/llm": float(llm_loss.item()),
                         "loss/weighted_tts": float(weighted_tts_loss.item()),
                         "loss/weighted_llm": float(weighted_llm_loss.item()),
+                        "loss/adv": float(adv_loss.item()),
+                        "loss/feat_match": float(feat_match_loss.item()),
+                        "loss/weighted_adv": float(weighted_adv_loss.item()),
+                        "loss/weighted_fm": float(weighted_fm_loss.item()),
+                        "loss/d": float(d_loss.item()) if d_loss is not None else 0.0,
                         "train/use_llm_loss": float(use_llm_loss),
+                        "train/disc_active": float(outputs["disc_active"]),
                         "loss/mel_pred": float(outputs["mel_pred_loss"].item()),
                         "loss/mel_post": float(outputs["mel_post_loss"].item()),
                         "loss/duration": float(outputs["duration_loss"].item()),
                         "train/epoch": epoch + 1,
                         "train/step": global_step,
                         "train/lr": float(scheduler.get_last_lr()[0]),
+                        "train/disc_lr": float(disc_scheduler.get_last_lr()[0]),
                     }
                     wandb.log(log_payload, step=global_step)
 
@@ -479,6 +563,9 @@ def main() -> None:
                             f"loss={log_payload['loss/total']:.4f} "
                             f"tts={log_payload['loss/tts']:.4f} "
                             f"llm={log_payload['loss/llm']:.4f} "
+                            f"adv={log_payload['loss/adv']:.4f} "
+                            f"fm={log_payload['loss/feat_match']:.4f} "
+                            f"d={log_payload['loss/d']:.4f} "
                             f"mel_pred={log_payload['loss/mel_pred']:.4f} "
                             f"mel_post={log_payload['loss/mel_post']:.4f} "
                             f"duration={log_payload['loss/duration']:.4f} "
@@ -494,6 +581,8 @@ def main() -> None:
                             scheduler,
                             epoch,
                             cfg.training.keep_last_n_checkpoints,
+                            disc_optimizer=disc_optimizer,
+                            disc_scheduler=disc_scheduler,
                         )
 
                     if should_dump_audio:
@@ -507,11 +596,20 @@ def main() -> None:
                         )
 
         if len(train_loader) % cfg.training.gradient_accumulation_steps != 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                raw_model.generator_parameters(), 1.0
+            )
+            torch.nn.utils.clip_grad_norm_(
+                raw_model.discriminator.parameters(), 1.0
+            )
             optimizer.step()
+            disc_optimizer.step()
             scheduler.step()
+            disc_scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+            disc_optimizer.zero_grad(set_to_none=True)
             global_step += 1
+            raw_model.disc_step.fill_(global_step)
 
     if is_main:
         save_checkpoint(
@@ -522,6 +620,8 @@ def main() -> None:
             scheduler=scheduler,
             epoch=cfg.training.num_train_epochs,
             keep_last_n_checkpoints=cfg.training.keep_last_n_checkpoints,
+            disc_optimizer=disc_optimizer,
+            disc_scheduler=disc_scheduler,
         )
         wandb.finish()
 

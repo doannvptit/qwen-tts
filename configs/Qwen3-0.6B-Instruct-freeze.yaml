@@ -13,6 +13,9 @@ peft:
     - v_proj
     - o_proj
   bias: "none"
+discriminator_warmup_steps: 10000
+discriminator_loss_weight: 1.0
+feature_matching_loss_weight: 1.0
 talker:
   delta: 0.2
   look_ahead: 0

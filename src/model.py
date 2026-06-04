@@ -12,6 +12,12 @@ from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import BitsAndBytesConfig, FineGrainedFP8Config
 
+from .components.mel_discriminator import (
+    MultiScaleMelDiscriminator,
+    discriminator_loss,
+    feature_matching_loss,
+    generator_adversarial_loss,
+)
 from .components.wav_decoder import WavDecoder
 from .components.wav_encoder import WavEncoder
 from .talker import Talker, TalkerConfig
@@ -53,6 +59,9 @@ class LlmSpokenModelConfig:
     talker: TalkerConfig
     vocos_model_id: str = "charactr/vocos-mel-24khz"
     peft: PeftConfig = field(default_factory=PeftConfig)
+    discriminator_warmup_steps: int = 10000
+    discriminator_loss_weight: float = 1.0
+    feature_matching_loss_weight: float = 1.0
 
     @classmethod
     def from_dict(cls, config: dict):
@@ -62,6 +71,15 @@ class LlmSpokenModelConfig:
             talker=TalkerConfig.from_dict(config["talker"]),
             vocos_model_id=config.get("vocos_model_id", "charactr/vocos-mel-24khz"),
             peft=cls.PeftConfig.from_dict(config.get("peft", {})),
+            discriminator_warmup_steps=int(
+                config.get("discriminator_warmup_steps", 10000)
+            ),
+            discriminator_loss_weight=float(
+                config.get("discriminator_loss_weight", 1.0)
+            ),
+            feature_matching_loss_weight=float(
+                config.get("feature_matching_loss_weight", 1.0)
+            ),
         )
 
     @classmethod
@@ -119,6 +137,13 @@ class LlmSpokenModel(nn.Module):
             mel_bins=config.talker.mel_bins, dtype=self.model.dtype
         )
         self.wav_decoder = WavDecoder(config.vocos_model_id)
+        self.discriminator = MultiScaleMelDiscriminator(n_mels=config.talker.mel_bins)
+        self.discriminator.to(device=self.model.device, dtype=torch.float32)
+
+        self.disc_warmup_steps = int(config.discriminator_warmup_steps)
+        self.disc_loss_weight = float(config.discriminator_loss_weight)
+        self.feat_match_loss_weight = float(config.feature_matching_loss_weight)
+        self.register_buffer("disc_step", torch.tensor(0, dtype=torch.long))
 
         if not self.peft_enabled:
             # setting model not trainable
@@ -127,7 +152,7 @@ class LlmSpokenModel(nn.Module):
 
         # setting wav decoder not trainable
         for param in self.wav_decoder.parameters():
-            param.requires_grad = False
+                param.requires_grad = False
 
 
 
@@ -140,6 +165,7 @@ class LlmSpokenModel(nn.Module):
         self.talker.train()
         self.wav_encoder.eval()
         self.wav_decoder.eval()
+        self.discriminator.train()
 
     def optimizer_param_groups(self) -> list[dict[str, list[torch.nn.Parameter]]]:
         param_groups = [{"params": list(self.talker.parameters())}]
@@ -148,6 +174,18 @@ class LlmSpokenModel(nn.Module):
             if peft_params:
                 param_groups.append({"params": peft_params})
         return param_groups
+
+    def discriminator_param_groups(self) -> list[dict[str, list[torch.nn.Parameter]]]:
+        return [{"params": list(self.discriminator.parameters())}]
+
+    def generator_parameters(self) -> list[torch.nn.Parameter]:
+        params: list[torch.nn.Parameter] = list(self.talker.parameters())
+        if self.peft_enabled:
+            params.extend(p for p in self.model.parameters() if p.requires_grad)
+        return params
+
+    def is_discriminator_active(self) -> bool:
+        return int(self.disc_step.item()) >= self.disc_warmup_steps
 
     def save_pretrained(self, path: str | Path):
         save_path = Path(path)
@@ -163,6 +201,12 @@ class LlmSpokenModel(nn.Module):
             for key, value in self.talker.state_dict().items()
         }
         save_file(talker_state, str(save_path / "talker.safetensors"))
+
+        discriminator_state = {
+            key: value.detach().cpu().contiguous()
+            for key, value in self.discriminator.state_dict().items()
+        }
+        save_file(discriminator_state, str(save_path / "discriminator.safetensors"))
 
         if self.peft_enabled:
             self.model.save_pretrained(save_path / "peft")
@@ -186,6 +230,11 @@ class LlmSpokenModel(nn.Module):
         talker_weights = load_file(str(load_path / "talker.safetensors"))
         instant.talker.load_state_dict(talker_weights)
 
+        discriminator_path = load_path / "discriminator.safetensors"
+        if discriminator_path.exists():
+            discriminator_weights = load_file(str(discriminator_path))
+            instant.discriminator.load_state_dict(discriminator_weights)
+
         if peft_path.exists() and peft_path.is_dir():
             from peft import PeftModel
 
@@ -201,6 +250,7 @@ class LlmSpokenModel(nn.Module):
         messages_batch: list[list[dict]],
         audio_batch: list[np.ndarray],
         output_audio_list: bool = False,
+        max_position_offset: int = 4096,
     ):
         model_device = next(self.model.parameters()).device
         use_no_grad_llm = not (
@@ -218,9 +268,20 @@ class LlmSpokenModel(nn.Module):
             labels = build_assistant_labels(input_ids, assistant_mask)
             input_embeds = self.model.get_input_embeddings()(input_ids)
 
+            position_offset = int(
+                torch.randint(0, max_position_offset + 1, (1,)).item()
+            )
+            position_ids = torch.arange(
+                position_offset,
+                position_offset + input_ids.size(1),
+                device=model_device,
+                dtype=torch.long,
+            ).unsqueeze(0)
+
             hidden_outputs = self.model(
                 inputs_embeds=input_embeds,
                 attention_mask=attention_mask,
+                position_ids=position_ids,
                 labels=labels,
                 output_hidden_states=True,
                 return_dict=True,
@@ -255,6 +316,25 @@ class LlmSpokenModel(nn.Module):
             audio_mel_lens,
         )
         outs["llm_loss"] = llm_loss
+        outs["audio_mels"] = audio_mels
+
+        adv_loss = torch.zeros((), device=model_device, dtype=torch.float32)
+        feat_match_loss = torch.zeros((), device=model_device, dtype=torch.float32)
+        if self.training and self.is_discriminator_active():
+            mel_post_f = outs["mel_post"].to(dtype=torch.float32)
+            audio_mels_f = audio_mels.to(dtype=torch.float32)
+            disc_fake_out, disc_fake_fmap = self.discriminator(mel_post_f)
+            with torch.no_grad():
+                disc_real_out, disc_real_fmap = self.discriminator(audio_mels_f)
+            adv_loss = generator_adversarial_loss(disc_fake_out).to(
+                device=model_device, dtype=torch.float32
+            )
+            feat_match_loss = feature_matching_loss(
+                disc_real_fmap, disc_fake_fmap
+            ).to(device=model_device, dtype=torch.float32)
+        outs["adv_loss"] = adv_loss
+        outs["feat_match_loss"] = feat_match_loss
+        outs["disc_active"] = self.is_discriminator_active()
 
         if output_audio_list:
             mel_post = outs["mel_post"].to(dtype=torch.float32)
@@ -265,6 +345,20 @@ class LlmSpokenModel(nn.Module):
                 for i in range(audio_preds.size(0))
             ]
         return outs
+
+    def discriminator_step(
+        self,
+        mel_post: torch.Tensor,
+        audio_mels: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self.is_discriminator_active():
+            return None
+        mel_post = mel_post.detach().to(dtype=torch.float32)
+        audio_mels = audio_mels.detach().to(dtype=torch.float32)
+        disc_real_out, _ = self.discriminator(audio_mels)
+        disc_fake_out, _ = self.discriminator(mel_post)
+        loss = discriminator_loss(disc_real_out, disc_fake_out)
+        return loss
 
     def _sample_next_token(
         self,
@@ -301,6 +395,7 @@ class LlmSpokenModel(nn.Module):
         temperature: float = 0.7,
         top_p: float = 0.95,
         sample_rate: int = 24_000,
+        max_position_offset: int = 4096,
     ):
         model_device = next(self.model.parameters()).device
         prompt_text = self.tokenizer.apply_chat_template(
@@ -312,9 +407,20 @@ class LlmSpokenModel(nn.Module):
         input_ids = model_inputs["input_ids"].to(model_device)
         attention_mask = model_inputs["attention_mask"].to(model_device)
 
+        position_offset = int(
+            torch.randint(0, max_position_offset + 1, (1,)).item()
+        )
+        position_ids = torch.arange(
+            position_offset,
+            position_offset + input_ids.size(1),
+            device=model_device,
+            dtype=torch.long,
+        ).unsqueeze(0)
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             use_cache=True,
             output_hidden_states=True,
             return_dict=True,
@@ -328,6 +434,7 @@ class LlmSpokenModel(nn.Module):
         generated_token_ids: list[int] = []
         generated_token_embeds: list[torch.Tensor] = []
         decoded_text = ""
+        next_position = position_offset + input_ids.size(1)
 
         while (
             len(generated_token_ids) < max_new_tokens
@@ -343,9 +450,13 @@ class LlmSpokenModel(nn.Module):
                 ],
                 dim=1,
             )
+            position_ids = torch.tensor(
+                [[next_position]], dtype=torch.long, device=model_device
+            )
             outputs = self.model(
                 input_ids=next_token,
                 attention_mask=attention_mask,
+                position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
                 output_hidden_states=True,
@@ -353,6 +464,7 @@ class LlmSpokenModel(nn.Module):
             )
             past_key_values = outputs.past_key_values
             generated_token_embeds.append(outputs.hidden_states[-1][0, -1])
+            next_position += 1
 
             delta = self.tokenizer.decode(
                 [token_id],
