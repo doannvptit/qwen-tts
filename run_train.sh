@@ -5,7 +5,7 @@
 #   NPROC=2 ./run_train_ddp.sh trainings/Qwen3-0.6B-Instruct.yaml
 set -euo pipefail
 
-CONFIG="${1:-trainings/Qwen3-0.6B-Instruct-freeze.yaml}"
+CONFIG="${1:-trainings/Qwen3-4B-Instruct-freeze.yaml}"
 NPROC="${NPROC:-2}"
 
 export WANDB_MODE="${WANDB_MODE:-online}"

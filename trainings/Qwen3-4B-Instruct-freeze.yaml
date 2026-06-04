@@ -18,8 +18,8 @@ model_config: ./configs/Qwen3-4B-Instruct-freeze.yaml
 training:
   output_dir: ./checkpoints/Qwen3-4B-Instruct-freeze
   num_train_epochs: 20
-  per_device_train_batch_size: 64
-  gradient_accumulation_steps: 1
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 16
   learning_rate: 1e-3
   weight_decay: 0.01
   tts_loss_weight: 1.0
