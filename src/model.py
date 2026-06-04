@@ -129,6 +129,9 @@ class LlmSpokenModel(nn.Module):
         for param in self.wav_decoder.parameters():
             param.requires_grad = False
 
+
+
+
     def setup_for_training(self) -> None:
         if self.peft_enabled:
             self.model.train()

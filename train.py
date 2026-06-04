@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+os.environ["HF_DATASETS_CACHE"] = "/data"
 import random
 import shutil
 from dataclasses import dataclass
@@ -89,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=str,
-        default="trainings/Qwen3-0.6B-Instruct.yaml",
+        default="trainings/Qwen3-0.6B-Instruct-freeze.yaml",
         help="Path to training yaml config.",
     )
     return parser.parse_args()
@@ -506,6 +507,7 @@ def main() -> None:
                         )
 
         if len(train_loader) % cfg.training.gradient_accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
