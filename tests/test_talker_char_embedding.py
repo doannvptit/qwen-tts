@@ -71,8 +71,8 @@ class IdentityPostNet(nn.Module):
         return mel_pred
 
 
-class TestTalkerCharEmbedding(unittest.TestCase):
-    def test_talker_adds_character_embedding_before_text_encoder(self):
+class TestTalkerVocabEmbedding(unittest.TestCase):
+    def test_talker_adds_projected_vocab_embedding_before_text_encoder(self):
         cfg = TalkerConfig(
             input_dim=4,
             hidden_dim=4,
@@ -96,6 +96,11 @@ class TestTalkerCharEmbedding(unittest.TestCase):
         )
         talker = Talker(cfg, device=torch.device("cpu"), dtype=torch.float32)
 
+        vocab_embed_mlp = nn.Linear(cfg.input_dim, cfg.input_dim, bias=False)
+        with torch.no_grad():
+            vocab_embed_mlp.weight.copy_(2.0 * torch.eye(cfg.input_dim))
+        talker.vocab_embed_mlp = vocab_embed_mlp
+
         capture_encoder = CaptureEmbedEncoder()
         talker.embed_encoder = capture_encoder
         talker.duration_aligner = DummyDurationAligner()
@@ -114,21 +119,64 @@ class TestTalkerCharEmbedding(unittest.TestCase):
             [[[1.0, 2.0, 3.0, 4.0], [0.5, 0.5, 0.5, 0.5], [2.0, 1.0, 0.0, 1.0]]],
             dtype=torch.float32,
         )
-        char_ids = torch.tensor([[2, 3, 4]], dtype=torch.long)
+        vocab_embeds = torch.tensor(
+            [[[0.1, 0.2, 0.3, 0.4], [1.0, 1.0, 1.0, 1.0], [0.0, 0.5, 1.0, 1.5]]],
+            dtype=torch.float32,
+        )
         embeds_len = torch.tensor([3], dtype=torch.long)
 
         mels = torch.zeros((1, 3, cfg.mel_bins), dtype=torch.float32)
         mels_len = torch.tensor([3], dtype=torch.long)
 
-        output = talker(embeds, embeds_len, char_ids, mels, mels_len)
+        output = talker(embeds, embeds_len, vocab_embeds, mels, mels_len)
 
-        expected_encoder_input = embeds + talker.char_embedding(char_ids)
+        expected_encoder_input = embeds + (2.0 * vocab_embeds)
         self.assertTrue(
             torch.allclose(capture_encoder.last_input, expected_encoder_input)
         )
         self.assertIn("mel_pred", output)
         self.assertIn("mel_post", output)
         self.assertEqual(tuple(output["mel_pred"].shape), (1, 3, cfg.mel_bins))
+
+    def test_vocab_embedding_mlp_trains_without_updating_vocab_embeds(self):
+        cfg = TalkerConfig(
+            input_dim=4,
+            hidden_dim=4,
+            encoder_layers=1,
+            encoder_heads=1,
+            encoder_conv_kernel_size=[3, 1],
+            encoder_max_position=32,
+            duration_predictor_kernel_size=3,
+            duration_predictor_num_layers=1,
+            mel_encoder_kernel_size=3,
+            mel_encoder_num_layers=1,
+            mel_decoder_kernel_size=3,
+            mel_decoder_num_layers=1,
+            post_net_kernel_size=3,
+            post_net_num_layers=1,
+            dropout_rate=0.0,
+            mel_bins=5,
+            delta=0.2,
+            look_ahead=2,
+            char_vocab_size=16,
+        )
+        talker = Talker(cfg, device=torch.device("cpu"), dtype=torch.float32)
+
+        embeds = torch.zeros((1, 2, cfg.input_dim), dtype=torch.float32)
+        vocab_embeds = torch.ones(
+            (1, 2, cfg.input_dim), dtype=torch.float32, requires_grad=True
+        )
+
+        loss = talker._prepare_embeds(embeds, vocab_embeds).sum()
+        loss.backward()
+
+        self.assertIsNone(vocab_embeds.grad)
+        mlp_grads = [
+            param.grad
+            for param in talker.vocab_embed_mlp.parameters()
+            if param.requires_grad
+        ]
+        self.assertTrue(any(grad is not None for grad in mlp_grads))
 
 
 if __name__ == "__main__":

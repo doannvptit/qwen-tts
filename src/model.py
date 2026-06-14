@@ -181,6 +181,7 @@ class LlmSpokenModel(nn.Module):
         )
 
         talker_weights = load_file(str(load_path / "talker.safetensors"))
+        talker_weights.pop("char_embedding.weight", None)
         instant.talker.load_state_dict(talker_weights)
 
         if peft_path.exists() and peft_path.is_dir():
@@ -212,7 +213,9 @@ class LlmSpokenModel(nn.Module):
             input_ids = input_ids.to(model_device)
             attention_mask = attention_mask.to(model_device)
             assistant_mask = assistant_mask.to(model_device)
-            labels = build_assistant_labels(input_ids, assistant_mask)
+            labels = None
+            if self.peft_enabled and self.training and self.model.training:
+                labels = build_assistant_labels(input_ids, assistant_mask)
             input_embeds = self.model.get_input_embeddings()(input_ids)
 
             hidden_outputs = self.model(
@@ -222,20 +225,25 @@ class LlmSpokenModel(nn.Module):
                 output_hidden_states=True,
                 return_dict=True,
             )
-            llm_loss = hidden_outputs.loss
             hidden_states = hidden_outputs.hidden_states[-1]
+            llm_loss = (
+                hidden_outputs.loss
+                if hidden_outputs.loss is not None
+                else hidden_states.new_zeros(())
+            )
             (
                 assistant_embeds,
                 assistant_embeds_length,
-                assistant_char_ids,
+                assistant_vocab_embeds,
             ) = extract_last_assistant_char_aligned_embeds(
                 self.tokenizer,
                 input_ids,
                 hidden_states,
+                input_embeds,
                 assistant_mask,
             )
             print(
-                f"Assistant embeds shape: {assistant_embeds.shape}, assistant_embeds_length: {assistant_embeds_length}, assistant_char_ids shape: {assistant_char_ids.shape}"
+                f"Assistant embeds shape: {assistant_embeds.shape}, assistant_embeds_length: {assistant_embeds_length}, assistant_vocab_embeds shape: {assistant_vocab_embeds.shape}"
             )
 
         with torch.no_grad():
@@ -247,7 +255,7 @@ class LlmSpokenModel(nn.Module):
         outs = self.talker(
             assistant_embeds,
             assistant_embeds_length,
-            assistant_char_ids,
+            assistant_vocab_embeds,
             audio_mels,
             audio_mel_lens,
         )
@@ -324,6 +332,7 @@ class LlmSpokenModel(nn.Module):
         eos_token_id = self.tokenizer.eos_token_id
         generated_token_ids: list[int] = []
         generated_token_embeds: list[torch.Tensor] = []
+        generated_token_vocab_embeds: list[torch.Tensor] = []
         decoded_text = ""
 
         while (
@@ -332,6 +341,8 @@ class LlmSpokenModel(nn.Module):
         ):
             token_id = int(next_token.item())
             generated_token_ids.append(token_id)
+            token_vocab_embed = self.model.get_input_embeddings()(next_token)[0, 0]
+            generated_token_vocab_embeds.append(token_vocab_embed)
 
             attention_mask = torch.cat(
                 [
@@ -383,13 +394,19 @@ class LlmSpokenModel(nn.Module):
             return
 
         token_embed_tensor = torch.stack(generated_token_embeds, dim=0)
-        expanded_embeds, expanded_char_ids = expand_token_embeds_to_chars(
+        token_vocab_embed_tensor = torch.stack(generated_token_vocab_embeds, dim=0)
+        expanded_embeds = expand_token_embeds_to_chars(
             self.tokenizer,
             generated_token_ids,
             token_embed_tensor,
         )
+        expanded_vocab_embeds = expand_token_embeds_to_chars(
+            self.tokenizer,
+            generated_token_ids,
+            token_vocab_embed_tensor,
+        )
         assistant_embeds = expanded_embeds.unsqueeze(0)
-        assistant_char_ids = expanded_char_ids.unsqueeze(0)
+        assistant_vocab_embeds = expanded_vocab_embeds.unsqueeze(0)
         assistant_embeds_len = torch.tensor(
             [expanded_embeds.size(0)],
             dtype=torch.long,
@@ -399,7 +416,7 @@ class LlmSpokenModel(nn.Module):
         talker_outs = self.talker.infer(
             assistant_embeds,
             assistant_embeds_len,
-            assistant_char_ids,
+            assistant_vocab_embeds,
         )
         mel_post = talker_outs["mel_post"].to(dtype=torch.float32)
         mel_lens = talker_outs["mel_lens"]

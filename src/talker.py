@@ -89,7 +89,12 @@ class Talker(nn.Module):
             postnet_kernel_size=cfg.post_net_kernel_size,
             postnet_n_convolutions=cfg.post_net_num_layers,
         )
-        self.char_embedding = nn.Embedding(cfg.char_vocab_size, cfg.input_dim)
+        self.vocab_embed_mlp = nn.Sequential(
+            nn.Linear(cfg.input_dim, cfg.hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(cfg.dropout_rate),
+            nn.Linear(cfg.hidden_dim, cfg.input_dim),
+        )
         self.to(device=device, dtype=dtype)
 
     def _expand_duration(
@@ -108,15 +113,22 @@ class Talker(nn.Module):
         ).transpose(1, 2)
         return embed_value_expanded, reconst_mel_lens
 
+    def _prepare_embeds(
+        self,
+        embeds: torch.Tensor,
+        vocab_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        return embeds + self.vocab_embed_mlp(vocab_embeds.detach())
+
     def forward(
         self,
         embeds: torch.Tensor,
         embeds_len: torch.Tensor,
-        char_ids: torch.Tensor,
+        vocab_embeds: torch.Tensor,
         mels: torch.Tensor,
         mels_len: torch.Tensor,
     ):
-        embeds = embeds + self.char_embedding(char_ids)
+        embeds = self._prepare_embeds(embeds, vocab_embeds)
 
         mel_mask = get_mask_from_lengths(mels_len, max_len=mels.size(1))
         embeds_key, embeds_value = self.embed_encoder(embeds, embeds_len)
@@ -165,9 +177,9 @@ class Talker(nn.Module):
         self,
         embeds: torch.Tensor,
         embeds_len: torch.Tensor,
-        char_ids: torch.Tensor,
+        vocab_embeds: torch.Tensor,
     ):
-        embeds = embeds + self.char_embedding(char_ids)
+        embeds = self._prepare_embeds(embeds, vocab_embeds)
         embeds_key, embeds_value = self.embed_encoder(embeds, embeds_len)
         embeds_mask = get_mask_from_lengths(embeds_len, max_len=embeds.size(1))
 
